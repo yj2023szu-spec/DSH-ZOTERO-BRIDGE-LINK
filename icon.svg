@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Zotero literature link">
+  <rect x="6" y="8" width="36" height="48" rx="6" fill="#1f6f8b"/>
+  <rect x="12" y="14" width="24" height="3.5" rx="1.75" fill="#eaf4f7"/>
+  <rect x="12" y="22" width="20" height="3.5" rx="1.75" fill="#eaf4f7"/>
+  <rect x="12" y="30" width="16" height="3.5" rx="1.75" fill="#eaf4f7"/>
+  <path d="M28 44c6-10 14-10 20-4 5 5 4 12-2 14-5 2-9-1-9-5 0-3 2-5 5-5 2 0 3 1 4 2" fill="none" stroke="#f2a541" stroke-width="4.5" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,6 @@
+# DSH × Zotero link bundle: registers the host plugin that exposes the
+# zotero_* tools, the /zotero-link web API and the "文献" conversation view.
+# The browser half rides the package's `dsh.client` manifest (client.js).
+- insert:
+    - id: zotero-link
+      name: '@local/dsh-zotero-link'

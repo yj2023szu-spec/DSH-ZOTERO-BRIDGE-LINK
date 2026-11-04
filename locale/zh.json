@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Zotero 文献联动",
+    "description": "读取 Zotero 当前在读文献、摘录与笔记，带页码原文引用提问，整理结果可写回 Zotero 笔记。"
+  }
+}

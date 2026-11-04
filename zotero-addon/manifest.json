@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "Zotero Link Bridge",
+  "version": "0.1.4",
+  "description": "Local HTTP bridge for DeepSeek Harness: read the active Zotero paper, annotations, notes and page text, and write notes back.",
+  "author": "AlbertYan",
+  "icons": {
+    "48": "content/icon-48.png",
+    "96": "content/icon-96.png"
+  },
+  "applications": {
+    "zotero": {
+      "id": "zotero-link@local",
+      "update_url": "https://example.com/zotero-link/update.json",
+      "strict_min_version": "10.0",
+      "strict_max_version": "11.*"
+    }
+  }
+}

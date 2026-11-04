@@ -1,0 +1,12 @@
+# dependencies & runtime state
+node_modules/
+__pycache__/
+*.log
+
+# generated review drafts (user content, not part of the source)
+reviews/*.md
+!reviews/.gitkeep
+
+# OS noise
+.DS_Store
+Thumbs.db
