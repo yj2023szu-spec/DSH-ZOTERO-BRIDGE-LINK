@@ -7,6 +7,7 @@
 - **回答回显**：面板显示「最近回答」（`GET /zotero-link/api/transcript`），只取最后一个已完成回合的最终 assistant 文本，过滤 reasoning、tool-call 与中间进度叙述；生成中显示「正在生成回答…」。
 - 一键「复制为笔记」（问 + 答 + 出处链接，Markdown）与「复制回答」。
 - 会话探测（`conversation.composer.dock`）记录当前会话并缓存到 localStorage，面板据此定位目标会话。
+- 桥接插件版本号对齐到 0.1.5（与 0.1.4 功能相同，仅版本一致，便于整套安装）。
 
 ### Fixed
 - 面板转发问题时不再重复拼接提问模板（客户端只发原始问题，Host 统一补上下文）。

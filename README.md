@@ -43,7 +43,7 @@
 
 ```text
 zotero-addon/            Zotero 桥接插件源码（manifest / bootstrap / content）
-dist/zotero-link.xpi     可直接安装的插件包（v0.1.4）
+dist/zotero-link.xpi     可直接安装的插件包（v0.1.5）
 index.js, lib/, client.js DSH bundle：工具、Web API、左侧面板与会话视图
 locale/, icon.svg        DSH 插件展示元数据
 scripts/                 构建、安装、契约/桩/活桥接冒烟测试

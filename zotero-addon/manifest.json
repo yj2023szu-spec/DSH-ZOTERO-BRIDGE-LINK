@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Zotero Link Bridge",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Local HTTP bridge for DeepSeek Harness: read the active Zotero paper, annotations, notes and page text, and write notes back.",
   "author": "AlbertYan",
   "icons": {
