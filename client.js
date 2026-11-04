@@ -7,6 +7,28 @@ window.__ModuleLoader__.load({
     const API = "/zotero-link/api";
     const POLL_MS = 5000;
 
+    // Session-scoped probe (composer dock) keeps the id of the conversation the
+    // user is currently looking at; the root-scoped sidebar panel needs it to
+    // deliver a question without leaving the panel.
+    let activeSessionId = null;
+    try {
+      if (typeof localStorage !== "undefined") activeSessionId = localStorage.getItem("zotero-link:session");
+    } catch {
+      /* ignore */
+    }
+
+    function SessionProbe(props) {
+      if (props && props.sessionId) {
+        activeSessionId = String(props.sessionId);
+        try {
+          localStorage.setItem("zotero-link:session", activeSessionId);
+        } catch {
+          /* ignore */
+        }
+      }
+      return null;
+    }
+
     const isZh = (() => {
       try {
         return String(navigator.language || "").toLowerCase().startsWith("zh");
@@ -54,6 +76,18 @@ window.__ModuleLoader__.load({
           statusBad: "桥接连不上",
           copyPrompt: "复制提问",
           copiedToPaste: "已复制，粘贴到对话输入框发送",
+          sendToChat: "发送到对话",
+          sending: "发送中…",
+          sent: "已发送到对话，回答会显示在这里",
+          sendFailed: "发送失败",
+          recentAnswer: "最近回答",
+          copyNote: "复制为笔记",
+          noteCopied: "已复制为笔记（Markdown）",
+          copyAnswer: "复制回答",
+          answerCopied: "已复制回答",
+          noAnswer: "还没有回答。在下面提问后，最终回答会显示在这里。",
+          youAsked: "你问",
+          generating: "正在生成回答…",
         }
       : {
           tab: "Library",
@@ -94,6 +128,18 @@ window.__ModuleLoader__.load({
           statusBad: "Bridge unavailable",
           copyPrompt: "Copy prompt",
           copiedToPaste: "Copied — paste it into the composer",
+          sendToChat: "Send to chat",
+          sending: "Sending…",
+          sent: "Sent to the conversation; the answer appears here",
+          sendFailed: "Send failed",
+          recentAnswer: "Latest answer",
+          copyNote: "Copy as note",
+          noteCopied: "Copied note (Markdown)",
+          copyAnswer: "Copy answer",
+          answerCopied: "Copied answer",
+          noAnswer: "No answer yet. Ask below and the final answer will appear here.",
+          youAsked: "You asked",
+          generating: "Generating…",
         };
 
     const CSS = `
@@ -117,6 +163,9 @@ window.__ModuleLoader__.load({
 .zl-row-head{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary)}
 .zl-dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--dsw-alias-state-idle-primary)}
 .zl-quote{white-space:pre-wrap;word-break:break-word;font-size:13px}
+.zl-answer{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.7;max-height:420px;overflow:auto;padding:2px 0}
+.zl-answer a{color:var(--dsw-alias-brand-primary);text-decoration:underline}
+.zl-q{color:var(--dsw-alias-label-secondary);font-size:12px;white-space:pre-wrap;word-break:break-word}
 .zl-comment{color:var(--dsw-alias-label-secondary);font-size:12px;border-left:2px solid var(--dsw-alias-border-l2);padding-left:8px;white-space:pre-wrap}
 .zl-row .zl-actions{margin-top:2px}
 .zl-empty{color:var(--dsw-alias-label-secondary);font-size:13px;padding:8px 2px}
@@ -133,8 +182,29 @@ window.__ModuleLoader__.load({
 .zl-hint{font-size:12px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap}
 `;
 
-    function pageLabelOf(annotation) {
-      if (!annotation) return "";
+    function renderInline(text) {
+      const nodes = [];
+      const source = String(text || "");
+      const pattern = /\[([^\]]+)\]\(((?:zotero|https?):\/\/[^)\s]+)\)/g;
+      let last = 0;
+      let key = 0;
+      let match;
+      while ((match = pattern.exec(source))) {
+        if (match.index > last) nodes.push(source.slice(last, match.index));
+        nodes.push(
+          h(
+            "a",
+            { key: `link-${key++}`, href: match[2], target: "_blank", rel: "noreferrer" },
+            match[1]
+          )
+        );
+        last = match.index + match[0].length;
+      }
+      if (last < source.length) nodes.push(source.slice(last));
+      return nodes;
+    }
+
+    function pageLabelOf(annotation) {      if (!annotation) return "";
       if (annotation.pageLabel) return `p.${annotation.pageLabel}`;
       if (Number.isInteger(annotation.pageIndex)) return `PDF p.${annotation.pageIndex + 1}`;
       return "";
@@ -164,6 +234,9 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = React.useState("annotations");
       const [question, setQuestion] = React.useState("");
       const [notice, setNotice] = React.useState(null);
+      const [sending, setSending] = React.useState(false);
+      const layout = props && props.layout;
+      if (props && props.sessionId) activeSessionId = String(props.sessionId);
 
       const load = React.useCallback(async () => {
         let status = null;
@@ -181,7 +254,15 @@ window.__ModuleLoader__.load({
         } catch (error) {
           current = { ok: false, code: "ZOTERO_DOWN", message: String((error && error.message) || error) };
         }
-        setState({ loading: false, status, current, statusError });
+        let transcript = null;
+        try {
+          const query = activeSessionId ? `&sessionId=${encodeURIComponent(activeSessionId)}` : "";
+          const response = await fetch(`${API}/transcript?limit=8${query}`, { cache: "no-store" });
+          transcript = await response.json();
+        } catch (error) {
+          transcript = { ok: false, code: "TRANSCRIPT_FAILED", message: String((error && error.message) || error) };
+        }
+        setState({ loading: false, status, current, statusError, transcript });
       }, []);
 
       React.useEffect(() => {
@@ -243,6 +324,87 @@ window.__ModuleLoader__.load({
       const current = state.current && state.current.ok ? state.current.data : null;
       const item = current && current.item;
       const page = current && current.page;
+
+      const sendQuestion = async (text) => {
+        setSending(true);
+        try {
+          const response = await fetch(`${API}/ask`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              sessionId: activeSessionId,
+              question: text,
+              context: {
+                itemKey: item && item.key,
+                title: item && item.title,
+                pageLabel: page && page.label,
+                pageIndex: page && page.index,
+              },
+            }),
+          });
+          const payload = await response.json();
+          if (!payload.ok) {
+            showNotice(`${TEXT.sendFailed}：${payload.message || payload.code}`, true);
+            return;
+          }
+          showNotice(TEXT.sent);
+          window.setTimeout(() => load(), 2500);
+        } catch (error) {
+          showNotice(`${TEXT.sendFailed}：${String((error && error.message) || error)}`, true);
+        } finally {
+          setSending(false);
+        }
+      };
+
+      const deliverAsk = (rawText) => {
+        const text =
+          String(rawText || "").trim() ||
+          (isZh ? "请介绍这篇文献的研究问题、方法、主要结论与局限。" : "Summarize this paper's question, method, findings and limitations.");
+        if (composerAvailable) return insertIntoComposer(askPrompt(item, page, text));
+        return sendQuestion(text);
+      };
+
+      const transcriptMessages =
+        (state.transcript && state.transcript.ok && state.transcript.data && state.transcript.data.messages) || [];
+      const transcriptRunning = Boolean(
+        state.transcript && state.transcript.ok && state.transcript.data && state.transcript.data.running
+      );
+      let lastAnswerIndex = -1;
+      for (let i = transcriptMessages.length - 1; i >= 0; i -= 1) {
+        if (transcriptMessages[i].role === "assistant") {
+          lastAnswerIndex = i;
+          break;
+        }
+      }
+      const lastAnswer = lastAnswerIndex >= 0 ? transcriptMessages[lastAnswerIndex] : null;
+      let lastQuestion = null;
+      for (let i = lastAnswerIndex - 1; i >= 0; i -= 1) {
+        if (transcriptMessages[i].role === "user") {
+          lastQuestion = transcriptMessages[i];
+          break;
+        }
+      }
+      const cleanQuestion = (text) => String(text || "").replace(/（请先用[\s\S]*?）\s*$/, "").trim();
+      const buildNote = () => {
+        const q = cleanQuestion(lastQuestion && lastQuestion.text);
+        const a = String((lastAnswer && lastAnswer.text) || "").trim();
+        const title = (item && item.title) || "Zotero 文献";
+        const meta = [item && item.creatorsLabel, item && item.year].filter(Boolean).join(" ");
+        const pageLabel = page && page.label ? `p.${page.label}` : "";
+        const lines = [`# 问答：${title}`];
+        if (meta || pageLabel) lines.push(`> ${[meta, pageLabel].filter(Boolean).join("，")}`);
+        lines.push("", "## 问", q, "", "## 答", a, "", "---");
+        lines.push(`来源：Zotero《${title}》${item && item.link ? ` ${item.link}` : ""}`);
+        return lines.join("\n");
+      };
+      const copyNote = async () => {
+        const ok = await copyText(buildNote());
+        showNotice(ok ? TEXT.noteCopied : TEXT.copyFailed, !ok);
+      };
+      const copyAnswer = async () => {
+        const ok = await copyText(String((lastAnswer && lastAnswer.text) || ""));
+        showNotice(ok ? TEXT.answerCopied : TEXT.copyFailed, !ok);
+      };
       const modeLabel = current
         ? current.mode === "reader"
           ? TEXT.readMode
@@ -452,13 +614,37 @@ window.__ModuleLoader__.load({
                   {
                     className: "zl-btn",
                     type: "button",
-                    onClick: () => insertIntoComposer(askPrompt(item, page, question)),
+                    onClick: () => deliverAsk(question),
                   },
                   TEXT.askThis
                 )
               )
             )
           : renderBody(),
+        h(
+          "div",
+          { className: "zl-card" },
+          h(
+            "div",
+            { className: "zl-actions", style: { justifyContent: "space-between" } },
+            h("div", { className: "zl-card-title" }, TEXT.recentAnswer),
+            transcriptRunning ? h("span", { className: "zl-notice" }, TEXT.generating) : null,
+            lastAnswer
+              ? h(
+                  "div",
+                  { className: "zl-actions" },
+                  h("button", { className: "zl-btn", type: "button", onClick: copyNote }, TEXT.copyNote),
+                  h("button", { className: "zl-btn", type: "button", onClick: copyAnswer }, TEXT.copyAnswer)
+                )
+              : null
+          ),
+          lastQuestion
+            ? h("div", { className: "zl-q" }, `${TEXT.youAsked}：${truncate(cleanQuestion(lastQuestion.text), 140)}`)
+            : null,
+          lastAnswer
+            ? h("div", { className: "zl-answer" }, renderInline(lastAnswer.text))
+            : h("div", { className: "zl-empty" }, TEXT.noAnswer)
+        ),
         item
           ? h(
               "div",
@@ -511,7 +697,7 @@ window.__ModuleLoader__.load({
                 className: "zl-chip",
                 type: "button",
                 onClick: () =>
-                  insertIntoComposer(
+                  deliverAsk(
                     item && item.key
                       ? `请用 zotero_item 读取《${item.title}》（key ${item.key}）的全部摘录与笔记，按主题整理成结构化笔记（要点 + 逐字原文 + zotero:// 链接），先给我 preview，不要直接写入。`
                       : `请把 Zotero 当前文献的摘录与笔记按主题整理成结构化笔记，先给我 preview。`
@@ -528,9 +714,10 @@ window.__ModuleLoader__.load({
               {
                 className: "zl-btn primary",
                 type: "button",
-                onClick: () => insertIntoComposer(askPrompt(item, page, question)),
+                disabled: sending,
+                onClick: () => deliverAsk(question),
               },
-              composerAvailable ? TEXT.fillComposer : TEXT.copyPrompt
+              composerAvailable ? TEXT.fillComposer : sending ? TEXT.sending : TEXT.sendToChat
             ),
             notice ? h("span", { className: `zl-notice${notice.warn ? " warn" : ""}` }, notice.text) : null
           )
@@ -571,6 +758,13 @@ window.__ModuleLoader__.load({
     return {
       inject: ["slots"],
       apply(ctx) {
+        let layout = null;
+        try {
+          layout = ctx.get("layout");
+        } catch {
+          layout = null;
+        }
+        const View = (props) => h(LiteratureView, Object.assign({}, props, { layout }));
         ctx.slots.inject("conversation.view", () =>
           ctx.slots.register(
             {
@@ -579,7 +773,7 @@ window.__ModuleLoader__.load({
               order: 15,
               label: () => TEXT.tab,
             },
-            LiteratureView
+            View
           )
         );
         ctx.slots.inject("sidebar.panellist", () =>
@@ -594,7 +788,13 @@ window.__ModuleLoader__.load({
           )
         );
         ctx.slots.inject("main", () =>
-          ctx.slots.register({ name: "main", key: "zotero-literature" }, LiteratureView)
+          ctx.slots.register({ name: "main", key: "zotero-literature" }, View)
+        );
+        ctx.slots.inject("conversation.composer.dock", () =>
+          ctx.slots.register(
+            { name: "conversation.composer.dock", id: "zotero-session-probe", order: 90 },
+            SessionProbe
+          )
         );
       },
     };

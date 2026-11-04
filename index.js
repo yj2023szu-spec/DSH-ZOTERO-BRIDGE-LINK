@@ -5,6 +5,7 @@
  * view. All Zotero access goes through the local zotero-link bridge addon on
  * 127.0.0.1:23119; this plugin never opens zotero.sqlite.
  */
+import { randomUUID } from "node:crypto";
 import { Bridge, BridgeError, errorResult } from "./lib/bridge.js";
 import { PreviewStore } from "./lib/preview.js";
 import * as fmt from "./lib/format.js";
@@ -346,7 +347,7 @@ export function apply(ctx) {
         webCtx.webServer.register({
           kind: "prefix",
           path: "/zotero-link",
-          handler: createWebHandler(bridge),
+          handler: createWebHandler(bridge, () => ctx.get("agents")),
         }),
       "zotero-link: web api"
     );
@@ -368,7 +369,76 @@ async function readJsonBody(req) {
   return JSON.parse(raw);
 }
 
-function createWebHandler(bridge) {
+function extractText(content) {
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+  }
+  return parts.join("\n").trim();
+}
+
+function transcriptOf(agent, limit) {
+  const session = agent && agent.session;
+  if (!session) return { messages: [], running: false, turn: null };
+  let events = [];
+  try {
+    events = (typeof session.ownEvents === "function" ? session.ownEvents() : null) || session.events || [];
+  } catch {
+    events = [];
+  }
+
+  // Only surface the final assistant text of a completed turn: intermediate
+  // assistant messages in the same turn are progress narration or tool calls.
+  const endedTurns = new Set();
+  let lastCompletedTurn = null;
+  let lastStartedTurn = null;
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    const data = event.data || {};
+    if (event.type === "turn/end" && Number.isInteger(data.turn)) {
+      endedTurns.add(data.turn);
+      lastCompletedTurn = data.turn;
+    } else if (event.type === "turn/start" && Number.isInteger(data.turn)) {
+      lastStartedTurn = data.turn;
+    }
+  }
+  const running = Number.isInteger(lastStartedTurn) && !endedTurns.has(lastStartedTurn);
+  const allowedTurn = running ? lastCompletedTurn : lastStartedTurn;
+
+  const messages = [];
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    const data = event.data || {};
+    if (event.type === "user/message") {
+      const text = extractText(data.content);
+      if (text) messages.push({ role: "user", text, seq: event.seq, time: event.time });
+    } else if (event.type === "assistant/message") {
+      if (Number.isInteger(allowedTurn) && Number.isInteger(data.turn) && data.turn !== allowedTurn) continue;
+      const text = extractText(data.message && data.message.content);
+      if (text) messages.push({ role: "assistant", text, seq: event.seq, time: event.time, turn: data.turn });
+    }
+  }
+  return {
+    messages: messages.slice(-Math.max(1, Math.min(limit, 20))),
+    running,
+    turn: Number.isInteger(lastStartedTurn) ? lastStartedTurn : null,
+  };
+}
+
+function buildAskText(question, context) {
+  const title = context.title ? `《${context.title}》` : "Zotero 当前文献";
+  const page = context.pageLabel
+    ? `（p.${context.pageLabel}）`
+    : Number.isInteger(context.pageIndex)
+      ? `（PDF p.${context.pageIndex + 1}）`
+      : "";
+  const key = context.itemKey ? `（key ${context.itemKey}）` : "";
+  return `${title}${page}${key}：\n${question}\n\n（请先用 zotero_current / zotero_pages 定位原文；回答给出印刷页码与 zotero:// 链接，引用逐字。）`;
+}
+
+function createWebHandler(bridge, getAgents) {
   return async function handler(req, res) {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const path = url.pathname;
@@ -410,6 +480,110 @@ function createWebHandler(bridge) {
         } catch (error) {
           return sendJson(res, 200, errorResult(error));
         }
+      }
+      if (req.method === "GET" && path === "/zotero-link/api/transcript") {
+        const agents = getAgents();
+        if (!agents) {
+          return sendJson(res, 200, { ok: false, code: "NO_AGENT_SERVICE", message: "当前 DSH 没有可用的 Agent 服务" });
+        }
+        const sessionId = url.searchParams.get("sessionId");
+        const limit = Number(url.searchParams.get("limit") || 8);
+        let agent = null;
+        if (sessionId) {
+          try {
+            agent = agents.get(String(sessionId));
+          } catch {
+            agent = null;
+          }
+        }
+        if (!agent) {
+          let roots = [];
+          try {
+            roots = agents.roots() || [];
+          } catch {
+            roots = [];
+          }
+          agent = roots.find((entry) => entry.status === "running") || roots[roots.length - 1] || null;
+        }
+        if (!agent) {
+          return sendJson(res, 200, { ok: false, code: "NO_SESSION", message: "当前没有打开的对话会话" });
+        }
+        const transcript = transcriptOf(agent, Number.isFinite(limit) ? limit : 8);
+        return sendJson(res, 200, {
+          ok: true,
+          data: { sessionId: agent.id, messages: transcript.messages, running: transcript.running, turn: transcript.turn },
+        });
+      }
+      if (req.method === "POST" && path === "/zotero-link/api/ask") {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch {
+          return sendJson(res, 400, { ok: false, code: "INVALID_ARG", message: "invalid JSON body" });
+        }
+        const question = String(body.question || "").trim();
+        if (!question) {
+          return sendJson(res, 400, { ok: false, code: "INVALID_ARG", message: "question is required" });
+        }
+        const agents = getAgents();
+        if (!agents) {
+          return sendJson(res, 200, {
+            ok: false,
+            code: "NO_AGENT_SERVICE",
+            message: "当前 DSH 没有可用的 Agent 服务",
+          });
+        }
+        let agent = null;
+        let resolvedBy = "session";
+        if (body.sessionId) {
+          try {
+            agent = agents.get(String(body.sessionId));
+          } catch {
+            agent = null;
+          }
+        }
+        if (!agent) {
+          resolvedBy = "roots";
+          let roots = [];
+          try {
+            roots = agents.roots() || [];
+          } catch {
+            roots = [];
+          }
+          agent = roots.find((entry) => entry.status === "running") || roots[roots.length - 1] || null;
+        }
+        if (!agent) {
+          return sendJson(res, 200, {
+            ok: false,
+            code: "NO_SESSION",
+            message: "当前没有打开的对话会话，请先在左侧打开一个会话再发送",
+          });
+        }
+        const text = buildAskText(question, body.context || {});
+        if (body.dryRun) {
+          return sendJson(res, 200, {
+            ok: true,
+            data: { sessionId: agent.id, resolvedBy, status: agent.status, preview: text },
+          });
+        }
+        try {
+          agent.followup({
+            id: randomUUID(),
+            role: "user",
+            content: [{ type: "text", text }],
+            source: { kind: "user" },
+          });
+        } catch (error) {
+          return sendJson(res, 200, {
+            ok: false,
+            code: "DELIVER_FAILED",
+            message: `投递失败：${(error && error.message) || error}`,
+          });
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          data: { sessionId: agent.id, resolvedBy, status: agent.status },
+        });
       }
       return sendJson(res, 404, { ok: false, code: "NOT_FOUND", message: "unknown route" });
     } catch (error) {

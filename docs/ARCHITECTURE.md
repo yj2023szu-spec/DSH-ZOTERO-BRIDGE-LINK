@@ -98,7 +98,11 @@ preview(markdown, target) ──▶ PreviewStore{ id, sessionId, payload, expire
 | GET | `/zotero-link/api/status` | 桥接状态（含 `BRIDGE_MISSING / ZOTERO_DOWN / OK`） |
 | GET | `/zotero-link/api/current` | 当前文献 + 本页摘录 + 最近阅读（页面 5s 轮询） |
 | GET | `/zotero-link/api/item?key=` | 摘录/笔记列表 |
+| GET | `/zotero-link/api/transcript?sessionId=&limit=` | 最近问答；只取最后一个**已完成 turn** 的最终 assistant 文本（过滤 reasoning / tool-call / 中间叙述） |
+| POST | `/zotero-link/api/ask` | 把问题作为用户消息投递到当前会话（`agent.followup`）；`sessionId` 缺省时取最近活跃 root agent，支持 `dryRun` |
 | POST | `/zotero-link/api/open` | 打开原文（转发桥接 `open`） |
+
+面板是 root 作用域，拿不到会话输入框的写入权限，因此「发送到对话」走 Host 投递；回答由 `/transcript` 从会话日志读取并回显。客户端通过 `conversation.composer.dock` 的会话探测组件记录当前 `sessionId`（并缓存到 localStorage）供面板使用。
 
 ### 系统提示契约（摘要）
 
