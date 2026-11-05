@@ -347,7 +347,14 @@ export function apply(ctx) {
         webCtx.webServer.register({
           kind: "prefix",
           path: "/zotero-link",
-          handler: createWebHandler(bridge, () => ctx.get("agents")),
+          handler: createWebHandler(
+            bridge,
+            () => ctx.get("agents"),
+            () => ctx.get("workspaceRegistry"),
+            () => ctx.get("agentDefaultModel"),
+            () => ctx.get("sessionPersistence"),
+            () => ctx.get("workspaceController")
+          ),
         }),
       "zotero-link: web api"
     );
@@ -408,9 +415,15 @@ function transcriptOf(agent, limit) {
   const allowedTurn = running ? lastCompletedTurn : lastStartedTurn;
 
   const messages = [];
+  let lastError = null;
   for (const event of events) {
     if (!event || typeof event !== "object") continue;
     const data = event.data || {};
+    if (event.type === "turn/end" && data.reason && data.reason.kind === "error" && data.reason.error) {
+      if (!Number.isInteger(allowedTurn) || data.turn === allowedTurn) {
+        lastError = data.reason.error.message || "模型调用失败";
+      }
+    }
     if (event.type === "user/message") {
       const text = extractText(data.content);
       if (text) messages.push({ role: "user", text, seq: event.seq, time: event.time });
@@ -424,6 +437,7 @@ function transcriptOf(agent, limit) {
     messages: messages.slice(-Math.max(1, Math.min(limit, 20))),
     running,
     turn: Number.isInteger(lastStartedTurn) ? lastStartedTurn : null,
+    error: lastError,
   };
 }
 
@@ -438,7 +452,77 @@ function buildAskText(question, context) {
   return `${title}${page}${key}：\n${question}\n\n（请先用 zotero_current / zotero_pages 定位原文；回答给出印刷页码与 zotero:// 链接，引用逐字。）`;
 }
 
-function createWebHandler(bridge, getAgents) {
+function resolveModelSelection(agents, getDefaultModel) {
+  try {
+    const service = getDefaultModel ? getDefaultModel() : null;
+    if (service && typeof service.currentSelection === "function") {
+      const selection = service.currentSelection();
+      if (selection && selection.provider && selection.model) return selection;
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const roots = agents && typeof agents.roots === "function" ? agents.roots() : [];
+    for (const candidate of roots || []) {
+      const session = candidate && candidate.session;
+      const header = session && typeof session.requestHeader === "function" ? session.requestHeader() : null;
+      const config = header && header.config;
+      if (config && config.provider && config.model) {
+        return { provider: config.provider, model: config.model, reasoningEffort: config.reasoningEffort };
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function toAgentOptions(selection) {
+  if (!selection || !selection.provider || !selection.model) return null;
+  return {
+    provider: selection.provider,
+    model: selection.model,
+    ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+  };
+}
+
+async function readArchivedSessionIds(controller) {
+  if (!controller || typeof controller.follow !== "function") return new Set();
+  const abort = new AbortController();
+  try {
+    for await (const frame of controller.follow(abort.signal)) {
+      if (frame && frame.type === "baseline" && frame.value) {
+        return new Set((frame.value.archivedSessionIds || []).map(String));
+      }
+    }
+  } catch {
+    /* fall through */
+  } finally {
+    try {
+      abort.abort();
+    } catch {
+      /* ignore */
+    }
+  }
+  // Fallback: read the durable registry file directly.
+  try {
+    const [{ readFileSync }, { homedir }, { join }] = await Promise.all([
+      import("node:fs"),
+      import("node:os"),
+      import("node:path"),
+    ]);
+    const file = join(homedir(), ".dsh", "storages", "workspace.json");
+    const data = JSON.parse(readFileSync(file, "utf8"));
+    const ids = data && data.global && data.global.archivedSessionIds;
+    if (Array.isArray(ids)) return new Set(ids.map(String));
+  } catch {
+    /* ignore */
+  }
+  return new Set();
+}
+
+function createWebHandler(bridge, getAgents, getWorkspaceRegistry, getDefaultModel, getSessionPersistence, getWorkspaceController) {
   return async function handler(req, res) {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const path = url.pathname;
@@ -481,6 +565,45 @@ function createWebHandler(bridge, getAgents) {
           return sendJson(res, 200, errorResult(error));
         }
       }
+      if (req.method === "GET" && path === "/zotero-link/api/workspaces") {
+        const registry = getWorkspaceRegistry();
+        const agents = getAgents();
+        const sessionId = url.searchParams.get("sessionId");
+        let sessionCwd = null;
+        if (agents && sessionId) {
+          try {
+            const agent = agents.get(String(sessionId));
+            sessionCwd = agent?.session?.header?.cwd ?? null;
+          } catch {
+            sessionCwd = null;
+          }
+        }
+        let workspaces = [];
+        if (registry) {
+          try {
+            workspaces = (registry.list() || []).map((workspace) => ({
+              id: workspace.id ?? workspace.workspaceId ?? null,
+              title: workspace.title ?? workspace.name ?? "",
+              path: workspace.path ?? workspace.directory ?? "",
+            }));
+          } catch {
+            workspaces = [];
+          }
+        }
+        let currentWorkspaceId = null;
+        if (registry && sessionCwd) {
+          try {
+            const current = registry.resolveByPath(sessionCwd);
+            currentWorkspaceId = current ? (current.id ?? current.workspaceId ?? null) : null;
+          } catch {
+            currentWorkspaceId = null;
+          }
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          data: { workspaces, currentWorkspaceId, sessionCwd },
+        });
+      }
       if (req.method === "GET" && path === "/zotero-link/api/transcript") {
         const agents = getAgents();
         if (!agents) {
@@ -494,6 +617,13 @@ function createWebHandler(bridge, getAgents) {
             agent = agents.get(String(sessionId));
           } catch {
             agent = null;
+          }
+          if (!agent) {
+            return sendJson(res, 200, {
+              ok: false,
+              code: "SESSION_NOT_LIVE",
+              message: "该文献的对话尚未打开，请点「打开本文对话」后再查看",
+            });
           }
         }
         if (!agent) {
@@ -511,7 +641,182 @@ function createWebHandler(bridge, getAgents) {
         const transcript = transcriptOf(agent, Number.isFinite(limit) ? limit : 8);
         return sendJson(res, 200, {
           ok: true,
-          data: { sessionId: agent.id, messages: transcript.messages, running: transcript.running, turn: transcript.turn },
+          data: { sessionId: agent.id, messages: transcript.messages, running: transcript.running, turn: transcript.turn, error: transcript.error },
+        });
+      }
+      if (req.method === "POST" && path === "/zotero-link/api/session/create") {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch {
+          return sendJson(res, 400, { ok: false, code: "INVALID_ARG", message: "invalid JSON body" });
+        }
+        const agents = getAgents();
+        if (!agents || typeof agents.create !== "function") {
+          return sendJson(res, 200, { ok: false, code: "NO_AGENT_SERVICE", message: "当前 DSH 没有可用的 Agent 服务" });
+        }
+        const registry = getWorkspaceRegistry();
+        const workspaceId = body.workspaceId ? String(body.workspaceId) : null;
+        let cwd = body.path ? String(body.path) : null;
+        if (!cwd && registry && workspaceId) {
+          try {
+            const direct = typeof registry.get === "function" ? registry.get(workspaceId) : null;
+            if (direct && direct.path) cwd = direct.path;
+          } catch {
+            /* ignore */
+          }
+          if (!cwd) {
+            try {
+              const match = (registry.list() || []).find(
+                (workspace) => String(workspace.id ?? workspace.workspaceId ?? "") === workspaceId
+              );
+              if (match && match.path) cwd = match.path;
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        const sessionId = randomUUID();
+        const selection = resolveModelSelection(agents, getDefaultModel);
+        const agentOptions = toAgentOptions(selection);
+        if (!agentOptions) {
+          return sendJson(res, 200, {
+            ok: false,
+            code: "NO_MODEL",
+            message: "找不到可用的默认模型：请先在任意对话里选好模型再试",
+          });
+        }
+        let workspaceEntity = null;
+        if (registry && workspaceId) {
+          try {
+            workspaceEntity =
+              (typeof registry.get === "function" ? registry.get(workspaceId) : null) ||
+              (registry.list() || []).find(
+                (workspace) => String(workspace.id ?? workspace.workspaceId ?? "") === workspaceId
+              ) ||
+              null;
+          } catch {
+            workspaceEntity = null;
+          }
+        }
+        try {
+          const handle = await agents.create({
+            sessionId,
+            agentOptions,
+            ...(cwd ? { meta: { cwd } } : {}),
+          });
+          const createdSessionId = handle.agent.id;
+          let attached = false;
+          if (workspaceEntity && typeof workspaceEntity.attachSession === "function") {
+            try {
+              await workspaceEntity.attachSession(createdSessionId);
+              attached = true;
+            } catch {
+              attached = false;
+            }
+          }
+          return sendJson(res, 200, {
+            ok: true,
+            data: { sessionId: createdSessionId, cwd, workspaceId, attached },
+          });
+        } catch (error) {
+          return sendJson(res, 200, {
+            ok: false,
+            code: "CREATE_FAILED",
+            message: `创建会话失败：${(error && error.message) || error}`,
+          });
+        }
+      }
+      if (req.method === "POST" && path === "/zotero-link/api/session/attach") {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch {
+          return sendJson(res, 400, { ok: false, code: "INVALID_ARG", message: "invalid JSON body" });
+        }
+        const registry = getWorkspaceRegistry();
+        const sessionId = body.sessionId ? String(body.sessionId) : null;
+        const workspaceId = body.workspaceId ? String(body.workspaceId) : null;
+        if (!registry || !sessionId || !workspaceId) {
+          return sendJson(res, 200, { ok: false, code: "INVALID_ARG", message: "sessionId 与 workspaceId 必填" });
+        }
+        let workspace = null;
+        try {
+          workspace =
+            (typeof registry.get === "function" ? registry.get(workspaceId) : null) ||
+            (registry.list() || []).find(
+              (entry) => String(entry.id ?? entry.workspaceId ?? "") === workspaceId
+            ) ||
+            null;
+        } catch {
+          workspace = null;
+        }
+        if (!workspace || typeof workspace.attachSession !== "function") {
+          return sendJson(res, 200, { ok: false, code: "NOT_FOUND", message: "找不到该工作区" });
+        }
+        try {
+          await workspace.attachSession(sessionId);
+          return sendJson(res, 200, { ok: true, data: { sessionId, workspaceId } });
+        } catch (error) {
+          return sendJson(res, 200, {
+            ok: false,
+            code: "ATTACH_FAILED",
+            message: `挂载会话失败：${(error && error.message) || error}`,
+          });
+        }
+      }
+      if (req.method === "POST" && path === "/zotero-link/api/session/validate") {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch {
+          return sendJson(res, 400, { ok: false, code: "INVALID_ARG", message: "invalid JSON body" });
+        }
+        const sessionId = body.sessionId ? String(body.sessionId) : null;
+        const workspaceId = body.workspaceId ? String(body.workspaceId) : null;
+        if (!sessionId) {
+          return sendJson(res, 400, { ok: false, code: "INVALID_ARG", message: "sessionId 必填" });
+        }
+        const agents = getAgents();
+        const registry = getWorkspaceRegistry();
+        const persistence = getSessionPersistence();
+        let live = false;
+        try {
+          live = Boolean(agents && agents.get(sessionId));
+        } catch {
+          live = false;
+        }
+        let workspace = null;
+        if (registry && workspaceId) {
+          try {
+            workspace =
+              (typeof registry.get === "function" ? registry.get(workspaceId) : null) ||
+              (registry.list() || []).find(
+                (entry) => String(entry.id ?? entry.workspaceId ?? "") === workspaceId
+              ) ||
+              null;
+          } catch {
+            workspace = null;
+          }
+        }
+        let attached = false;
+        if (workspace && Array.isArray(workspace.sessionIds)) {
+          attached = workspace.sessionIds.map(String).includes(sessionId);
+        }
+        let archived = false;
+        try {
+          const archivedIds = await readArchivedSessionIds(getWorkspaceController ? getWorkspaceController() : null);
+          archived = archivedIds.has(sessionId);
+        } catch {
+          archived = false;
+        }
+        // The workspace list is the source of truth, and archived sessions are
+        // hidden from it: treat both "not attached" and "archived" as gone so a
+        // fresh conversation gets created instead of silently reusing the old one.
+        const exists = attached && !archived;
+        return sendJson(res, 200, {
+          ok: true,
+          data: { sessionId, workspaceId, exists, live, attached, archived },
         });
       }
       if (req.method === "POST" && path === "/zotero-link/api/ask") {
@@ -535,11 +840,41 @@ function createWebHandler(bridge, getAgents) {
         }
         let agent = null;
         let resolvedBy = "session";
-        if (body.sessionId) {
+        const requestedSessionId = body.sessionId ? String(body.sessionId) : null;
+        const defaultOptions = toAgentOptions(resolveModelSelection(agents, getDefaultModel));
+        if (requestedSessionId) {
           try {
-            agent = agents.get(String(body.sessionId));
+            agent = agents.get(requestedSessionId);
           } catch {
             agent = null;
+          }
+          if (!agent) {
+            try {
+              const handle = await agents.resume({
+                resumeSessionId: requestedSessionId,
+                ...(defaultOptions ? { agentOptions: defaultOptions } : {}),
+              });
+              agent = handle && (handle.agent || handle);
+            } catch {
+              agent = null;
+            }
+          }
+          if (!agent) {
+            return sendJson(res, 200, {
+              ok: false,
+              code: "SESSION_NOT_LIVE",
+              message: "该文献的对话无法恢复，请点「打开本文对话」后再提问",
+            });
+          }
+        }
+        if (agent) {
+          try {
+            const current = agent.model && typeof agent.model.current === "function" ? agent.model.current() : null;
+            if ((!current || !current.provider || !current.model) && defaultOptions) {
+              agent.model.select(defaultOptions);
+            }
+          } catch {
+            /* model repair is best effort */
           }
         }
         if (!agent) {

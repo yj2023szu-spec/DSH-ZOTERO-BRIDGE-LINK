@@ -98,11 +98,22 @@ preview(markdown, target) ──▶ PreviewStore{ id, sessionId, payload, expire
 | GET | `/zotero-link/api/status` | 桥接状态（含 `BRIDGE_MISSING / ZOTERO_DOWN / OK`） |
 | GET | `/zotero-link/api/current` | 当前文献 + 本页摘录 + 最近阅读（页面 5s 轮询） |
 | GET | `/zotero-link/api/item?key=` | 摘录/笔记列表 |
-| GET | `/zotero-link/api/transcript?sessionId=&limit=` | 最近问答；只取最后一个**已完成 turn** 的最终 assistant 文本（过滤 reasoning / tool-call / 中间叙述） |
+| GET | `/zotero-link/api/workspaces?sessionId=` | DSH 工作区列表 + 当前会话所属工作区 |
+| GET | `/zotero-link/api/transcript?sessionId=&limit=` | 最近问答；只取最后一个**已完成 turn** 的最终 assistant 文本（过滤 reasoning / tool-call / 中间叙述），附失败原因 |
+| POST | `/zotero-link/api/session/create` | 在指定工作区用 `agents.create({ sessionId, agentOptions, meta:{cwd} })` 建会话，并 `attachSession` 挂到工作区 |
+| POST | `/zotero-link/api/session/attach` | 把已有会话挂到工作区（修复历史孤儿会话） |
+| POST | `/zotero-link/api/session/validate` | 校验会话是否仍属于该工作区且未被归档；失效则前端清映射重建 |
 | POST | `/zotero-link/api/ask` | 把问题作为用户消息投递到当前会话（`agent.followup`）；`sessionId` 缺省时取最近活跃 root agent，支持 `dryRun` |
 | POST | `/zotero-link/api/open` | 打开原文（转发桥接 `open`） |
 
-面板是 root 作用域，拿不到会话输入框的写入权限，因此「发送到对话」走 Host 投递；回答由 `/transcript` 从会话日志读取并回显。客户端通过 `conversation.composer.dock` 的会话探测组件记录当前 `sessionId`（并缓存到 localStorage）供面板使用。
+面板是 root 作用域，拿不到会话输入框的写入权限，因此「发送到对话」走 Host 投递；回答由 `/transcript` 从会话日志读取并回显。
+
+### 每篇文献一个对话
+
+- 客户端用 `localStorage["zotero-link:sessions"]` 维护 `itemKey → sessionId` 映射，`localStorage["zotero-link:workspace"]` 记录所选工作区。
+- 会话一律由 Host 创建：先解析默认模型（`agentDefaultModel.currentSelection()`，失败则取任意 live root 会话的 `session.requestHeader().config`），再 `agents.create`，因此创建过程不经过 UI、不会跳转视图。
+- 每次面板加载/切换文献/提问前调用 `/api/session/validate`：只有「仍在工作区 `sessionIds` 中且不在 `archivedSessionIds` 中」才复用；否则清除映射并新建（Host 侧创建，仍然不跳转）。
+- 新会话创建后立即 `workspace.attachSession(sessionId)`，保证侧边栏可见；历史会话在面板加载/打开时按需补挂。
 
 ### 系统提示契约（摘要）
 

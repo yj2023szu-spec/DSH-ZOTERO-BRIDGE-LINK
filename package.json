@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-zotero-link",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Zotero literature integration for DeepSeek Harness: the paper you are reading, grounded Q&A with page links, Zotero notes, and literature-review drafts traceable to the source.",
   "type": "module",

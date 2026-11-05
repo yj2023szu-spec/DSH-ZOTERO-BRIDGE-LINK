@@ -11,6 +11,30 @@ window.__ModuleLoader__.load({
     // user is currently looking at; the root-scoped sidebar panel needs it to
     // deliver a question without leaving the panel.
     let activeSessionId = null;
+    const STORE = {
+      sessions: "zotero-link:sessions",
+      workspace: "zotero-link:workspace",
+      follow: "zotero-link:follow",
+    };
+    function readStore(key, fallback) {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
+      } catch {
+        return fallback;
+      }
+    }
+    function writeStore(key, value) {
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch {
+        /* ignore */
+      }
+    }
+    function readSessionMap() {
+      const map = readStore(STORE.sessions, {});
+      return map && typeof map === "object" ? map : {};
+    }
     try {
       if (typeof localStorage !== "undefined") activeSessionId = localStorage.getItem("zotero-link:session");
     } catch {
@@ -88,6 +112,15 @@ window.__ModuleLoader__.load({
           noAnswer: "还没有回答。在下面提问后，最终回答会显示在这里。",
           youAsked: "你问",
           generating: "正在生成回答…",
+          workspace: "工作区",
+          selectWorkspace: "选择工作区",
+          followPaper: "跟随当前文献",
+          openSession: "打开本文对话",
+          newSession: "新建本文对话",
+          noWorkspace: "请先在右上角选择工作区",
+          createFailed: "创建会话失败",
+          sessionCreated: "已为本文新建对话",
+          turnError: "上次提问失败",
         }
       : {
           tab: "Library",
@@ -140,6 +173,15 @@ window.__ModuleLoader__.load({
           noAnswer: "No answer yet. Ask below and the final answer will appear here.",
           youAsked: "You asked",
           generating: "Generating…",
+          workspace: "Workspace",
+          selectWorkspace: "Select workspace",
+          followPaper: "Follow current paper",
+          openSession: "Open paper chat",
+          newSession: "New paper chat",
+          noWorkspace: "Pick a workspace in the header first",
+          createFailed: "Could not create the chat",
+          sessionCreated: "Created a chat for this paper",
+          turnError: "Last question failed",
         };
 
     const CSS = `
@@ -166,6 +208,21 @@ window.__ModuleLoader__.load({
 .zl-answer{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.7;max-height:420px;overflow:auto;padding:2px 0}
 .zl-answer a{color:var(--dsw-alias-brand-primary);text-decoration:underline}
 .zl-q{color:var(--dsw-alias-label-secondary);font-size:12px;white-space:pre-wrap;word-break:break-word}
+.zl-select{appearance:none;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:6px;padding:2px 6px;font:inherit;font-size:12px;max-width:190px}
+.zl-check{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.zl-md-p{white-space:pre-wrap;word-break:break-word;margin:0 0 8px}
+.zl-md-p:last-child{margin-bottom:0}
+.zl-md-h{margin:12px 0 6px;font-weight:600;line-height:1.4}
+.zl-md-h1{font-size:16px}
+.zl-md-h2{font-size:15px}
+.zl-md-h3{font-size:14px}
+.zl-md-ul,.zl-md-ol{margin:0 0 8px 18px;padding:0}
+.zl-md-ul li,.zl-md-ol li{margin:2px 0;white-space:pre-wrap;word-break:break-word}
+.zl-md-quote{margin:6px 0;padding:6px 10px;border-left:2px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word}
+.zl-md-pre{white-space:pre-wrap;word-break:break-word;background:var(--dsw-alias-bg-layer-2);border-radius:8px;padding:8px 10px;overflow:auto;font-size:12px;margin:0 0 8px}
+.zl-answer strong{font-weight:600}
+.zl-answer em{font-style:italic}
+.zl-answer code{background:var(--dsw-alias-bg-layer-2);border-radius:4px;padding:0 4px;font-size:12px}
 .zl-comment{color:var(--dsw-alias-label-secondary);font-size:12px;border-left:2px solid var(--dsw-alias-border-l2);padding-left:8px;white-space:pre-wrap}
 .zl-row .zl-actions{margin-top:2px}
 .zl-empty{color:var(--dsw-alias-label-secondary);font-size:13px;padding:8px 2px}
@@ -181,6 +238,139 @@ window.__ModuleLoader__.load({
 .zl-chip:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
 .zl-hint{font-size:12px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap}
 `;
+
+    function inlineMd(text, keyPrefix) {
+      const nodes = [];
+      const source = String(text ?? "");
+      const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)|\*[^*\n]+\*)/g;
+      let last = 0;
+      let index = 0;
+      let match;
+      while ((match = pattern.exec(source))) {
+        if (match.index > last) nodes.push(source.slice(last, match.index));
+        const token = match[0];
+        if (token.startsWith("`")) {
+          nodes.push(h("code", { key: `${keyPrefix}-c${index++}` }, token.slice(1, -1)));
+        } else if (token.startsWith("**")) {
+          nodes.push(h("strong", { key: `${keyPrefix}-b${index++}` }, token.slice(2, -2)));
+        } else if (token.startsWith("[")) {
+          const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+          if (link) {
+            nodes.push(
+              h("a", { key: `${keyPrefix}-a${index++}`, href: link[2], target: "_blank", rel: "noreferrer" }, link[1])
+            );
+          } else {
+            nodes.push(token);
+          }
+        } else if (token.startsWith("*")) {
+          nodes.push(h("em", { key: `${keyPrefix}-i${index++}` }, token.slice(1, -1)));
+        } else {
+          nodes.push(token);
+        }
+        last = match.index + token.length;
+      }
+      if (last < source.length) nodes.push(source.slice(last));
+      return nodes;
+    }
+
+    function renderMarkdown(text) {
+      const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+      const blocks = [];
+      let i = 0;
+      let key = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        if (/^\s*$/.test(line)) {
+          i += 1;
+          continue;
+        }
+        if (/^\s*```/.test(line)) {
+          i += 1;
+          const code = [];
+          while (i < lines.length && !/^\s*```/.test(lines[i])) {
+            code.push(lines[i]);
+            i += 1;
+          }
+          i += 1;
+          blocks.push(h("pre", { key: `pre-${key++}`, className: "zl-md-pre" }, h("code", null, code.join("\n"))));
+          continue;
+        }
+        const heading = line.match(/^(#{1,6})\s+(.*)$/);
+        if (heading) {
+          const level = heading[1].length;
+          blocks.push(
+            h(
+              `h${Math.min(level + 1, 6)}`,
+              { key: `h-${key++}`, className: `zl-md-h zl-md-h${level}` },
+              inlineMd(heading[2], `h${key}`)
+            )
+          );
+          i += 1;
+          continue;
+        }
+        if (/^\s*(---+|\*\*\*+)\s*$/.test(line)) {
+          blocks.push(h("hr", { key: `hr-${key++}` }));
+          i += 1;
+          continue;
+        }
+        if (/^\s*[-*+]\s+/.test(line)) {
+          const items = [];
+          while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+            items.push(lines[i].replace(/^\s*[-*+]\s+/, ""));
+            i += 1;
+          }
+          blocks.push(
+            h(
+              "ul",
+              { key: `ul-${key++}`, className: "zl-md-ul" },
+              items.map((item, n) => h("li", { key: `li-${n}` }, inlineMd(item, `ul${key}${n}`)))
+            )
+          );
+          continue;
+        }
+        if (/^\s*\d+[.)]\s+/.test(line)) {
+          const items = [];
+          while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+            items.push(lines[i].replace(/^\s*\d+[.)]\s+/, ""));
+            i += 1;
+          }
+          blocks.push(
+            h(
+              "ol",
+              { key: `ol-${key++}`, className: "zl-md-ol" },
+              items.map((item, n) => h("li", { key: `li-${n}` }, inlineMd(item, `ol${key}${n}`)))
+            )
+          );
+          continue;
+        }
+        if (/^\s*>\s?/.test(line)) {
+          const parts = [];
+          while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+            parts.push(lines[i].replace(/^\s*>\s?/, ""));
+            i += 1;
+          }
+          blocks.push(
+            h("blockquote", { key: `bq-${key++}`, className: "zl-md-quote" }, inlineMd(parts.join("\n"), `bq${key}`))
+          );
+          continue;
+        }
+        const paragraph = [];
+        while (
+          i < lines.length &&
+          !/^\s*$/.test(lines[i]) &&
+          !/^\s*(#{1,6}\s|```|[-*+]\s|\d+[.)]\s|>\s?|---)/.test(lines[i])
+        ) {
+          paragraph.push(lines[i]);
+          i += 1;
+        }
+        if (paragraph.length) {
+          blocks.push(h("p", { key: `p-${key++}`, className: "zl-md-p" }, inlineMd(paragraph.join("\n"), `p${key}`)));
+        } else {
+          i += 1;
+        }
+      }
+      return blocks;
+    }
 
     function renderInline(text) {
       const nodes = [];
@@ -204,7 +394,8 @@ window.__ModuleLoader__.load({
       return nodes;
     }
 
-    function pageLabelOf(annotation) {      if (!annotation) return "";
+    function pageLabelOf(annotation) {
+      if (!annotation) return "";
       if (annotation.pageLabel) return `p.${annotation.pageLabel}`;
       if (Number.isInteger(annotation.pageIndex)) return `PDF p.${annotation.pageIndex + 1}`;
       return "";
@@ -236,6 +427,12 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(null);
       const [sending, setSending] = React.useState(false);
       const layout = props && props.layout;
+      const getService = (props && props.getService) || (() => null);
+      const [workspaces, setWorkspaces] = React.useState([]);
+      const [workspaceId, setWorkspaceId] = React.useState(() => readStore(STORE.workspace, null));
+      const [sessionMapVersion, setSessionMapVersion] = React.useState(0);
+      const transcriptSessionRef = React.useRef(null);
+      const ensureRef = React.useRef({ key: null, busy: false });
       if (props && props.sessionId) activeSessionId = String(props.sessionId);
 
       const load = React.useCallback(async () => {
@@ -256,11 +453,25 @@ window.__ModuleLoader__.load({
         }
         let transcript = null;
         try {
-          const query = activeSessionId ? `&sessionId=${encodeURIComponent(activeSessionId)}` : "";
+          const sessionForTranscript = transcriptSessionRef.current || activeSessionId;
+          const query = sessionForTranscript ? `&sessionId=${encodeURIComponent(sessionForTranscript)}` : "";
           const response = await fetch(`${API}/transcript?limit=8${query}`, { cache: "no-store" });
           transcript = await response.json();
         } catch (error) {
           transcript = { ok: false, code: "TRANSCRIPT_FAILED", message: String((error && error.message) || error) };
+        }
+        try {
+          const sessionForWorkspace = transcriptSessionRef.current || activeSessionId;
+          const query = sessionForWorkspace ? `?sessionId=${encodeURIComponent(sessionForWorkspace)}` : "";
+          const response = await fetch(`${API}/workspaces${query}`, { cache: "no-store" });
+          const workspaceData = await response.json();
+          if (workspaceData && workspaceData.ok && workspaceData.data) {
+            const list = Array.isArray(workspaceData.data.workspaces) ? workspaceData.data.workspaces : [];
+            setWorkspaces(list);
+            setWorkspaceId((previous) => previous || workspaceData.data.currentWorkspaceId || (list[0] && list[0].id) || null);
+          }
+        } catch {
+          /* workspace list is optional */
         }
         setState({ loading: false, status, current, statusError, transcript });
       }, []);
@@ -325,14 +536,126 @@ window.__ModuleLoader__.load({
       const item = current && current.item;
       const page = current && current.page;
 
+      const attachSession = (sid) => {
+        if (!sid || !workspaceId) return;
+        fetch(`${API}/session/attach`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: String(sid), workspaceId }),
+        }).catch(() => {
+          /* visibility best effort */
+        });
+      };
+
+      const openSession = (sid) => {
+        if (!sid) return false;
+        attachSession(sid);
+        const sessions = getService("sessions");
+        if (sessions && typeof sessions.open === "function") {
+          try {
+            sessions.open(String(sid));
+            return true;
+          } catch {
+            /* fall through */
+          }
+        }
+        const workspace = getService("uiWorkspace");
+        if (workspace && typeof workspace.openSession === "function") {
+          try {
+            workspace.openSession(String(sid));
+            return true;
+          } catch {
+            /* ignore */
+          }
+        }
+        return false;
+      };
+
+      const rememberSession = (key, sid) => {
+        const map = readSessionMap();
+        map[String(key)] = String(sid);
+        writeStore(STORE.sessions, map);
+        setSessionMapVersion((version) => version + 1);
+      };
+
+      const forgetSession = (key) => {
+        const map = readSessionMap();
+        if (!Object.prototype.hasOwnProperty.call(map, String(key))) return;
+        delete map[String(key)];
+        writeStore(STORE.sessions, map);
+        setSessionMapVersion((version) => version + 1);
+      };
+
+      const validateSession = async (sid) => {
+        try {
+          const response = await fetch(`${API}/session/validate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId: String(sid), workspaceId }),
+          });
+          const payload = await response.json();
+          return Boolean(payload && payload.ok && payload.data && payload.data.exists);
+        } catch {
+          // Network hiccup: keep the mapping instead of spawning a duplicate.
+          return true;
+        }
+      };
+
+      const createSessionForItem = async (key, options) => {
+        const silent = Boolean(options && options.silent);
+        if (!workspaceId) {
+          if (!silent) showNotice(TEXT.noWorkspace, true);
+          return null;
+        }
+        const workspace = workspaces.find((entry) => String(entry.id) === String(workspaceId));
+        try {
+          const response = await fetch(`${API}/session/create`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workspaceId, path: workspace && workspace.path }),
+          });
+          const payload = await response.json();
+          if (!payload.ok || !payload.data || !payload.data.sessionId) {
+            showNotice(`${TEXT.createFailed}${payload && payload.message ? `：${payload.message}` : ""}`, true);
+            return null;
+          }
+          const sessionId = String(payload.data.sessionId);
+          rememberSession(key, sessionId);
+          if (!silent) showNotice(TEXT.sessionCreated);
+          return sessionId;
+        } catch (error) {
+          showNotice(`${TEXT.createFailed}：${(error && error.message) || error}`, true);
+          return null;
+        }
+      };
+
       const sendQuestion = async (text) => {
+        let target = null;
+        if (item && item.key) {
+          const map = readSessionMap();
+          if (map[item.key] && (await validateSession(map[item.key]))) {
+            target = String(map[item.key]);
+          } else {
+            forgetSession(item.key);
+            target = await createSessionForItem(item.key);
+            if (!target) return;
+          }
+        } else {
+          target = activeSessionId;
+        }
+        if (!target) {
+          showNotice(TEXT.noWorkspace, true);
+          return;
+        }
+        activeSessionId = target;
+        attachSession(target);
         setSending(true);
         try {
           const response = await fetch(`${API}/ask`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              sessionId: activeSessionId,
+              sessionId: target,
               question: text,
               context: {
                 itemKey: item && item.key,
@@ -369,6 +692,8 @@ window.__ModuleLoader__.load({
       const transcriptRunning = Boolean(
         state.transcript && state.transcript.ok && state.transcript.data && state.transcript.data.running
       );
+      const transcriptError =
+        state.transcript && state.transcript.ok && state.transcript.data && state.transcript.data.error;
       let lastAnswerIndex = -1;
       for (let i = transcriptMessages.length - 1; i >= 0; i -= 1) {
         if (transcriptMessages[i].role === "assistant") {
@@ -405,6 +730,34 @@ window.__ModuleLoader__.load({
         const ok = await copyText(String((lastAnswer && lastAnswer.text) || ""));
         showNotice(ok ? TEXT.answerCopied : TEXT.copyFailed, !ok);
       };
+
+      const itemKey = item && item.key;
+      const boundSession = itemKey ? readSessionMap()[itemKey] : null;
+      transcriptSessionRef.current = boundSession || activeSessionId;
+
+      // If the mapped session was deleted (or no longer belongs to this
+      // workspace), drop the stale mapping and create a fresh one for this paper.
+      // Creation is host-side, so the panel does not navigate away.
+      React.useEffect(() => {
+        if (!itemKey || !workspaceId) return;
+        const sym = `${itemKey}:${workspaceId}`;
+        if (ensureRef.current.key === sym || ensureRef.current.busy) return;
+        ensureRef.current.busy = true;
+        (async () => {
+          let sid = readSessionMap()[itemKey];
+          if (sid) {
+            const ok = await validateSession(sid);
+            if (!ok) {
+              forgetSession(itemKey);
+              sid = null;
+            }
+          }
+          if (!sid) sid = await createSessionForItem(itemKey, { silent: true });
+          if (sid) ensureRef.current.key = sym;
+        })().finally(() => {
+          ensureRef.current.busy = false;
+        });
+      }, [itemKey, workspaceId]);
       const modeLabel = current
         ? current.mode === "reader"
           ? TEXT.readMode
@@ -568,6 +921,31 @@ window.__ModuleLoader__.load({
                   : TEXT.disconnected
               )
             ),
+            h(
+              "label",
+              { className: "zl-meta" },
+              h("span", null, TEXT.workspace),
+              h(
+                "select",
+                {
+                  className: "zl-select",
+                  value: workspaceId || "",
+                  onChange: (event) => {
+                    const value = event.target.value || null;
+                    setWorkspaceId(value);
+                    writeStore(STORE.workspace, value);
+                  },
+                },
+                h("option", { value: "" }, TEXT.selectWorkspace),
+                workspaces.map((workspace) =>
+                  h(
+                    "option",
+                    { key: workspace.id, value: workspace.id },
+                    workspace.title || workspace.path || workspace.id
+                  )
+                )
+              )
+            ),
             h("button", { className: "zl-btn", type: "button", onClick: load }, TEXT.refresh)
           )
         ),
@@ -617,6 +995,22 @@ window.__ModuleLoader__.load({
                     onClick: () => deliverAsk(question),
                   },
                   TEXT.askThis
+                ),
+                h(
+                  "button",
+                  {
+                    className: "zl-btn",
+                    type: "button",
+                    onClick: async () => {
+                      if (boundSession) {
+                        openSession(boundSession);
+                        return;
+                      }
+                      const sid = await createSessionForItem(itemKey);
+                      if (sid) openSession(sid);
+                    },
+                  },
+                  boundSession ? TEXT.openSession : TEXT.newSession
                 )
               )
             )
@@ -642,8 +1036,13 @@ window.__ModuleLoader__.load({
             ? h("div", { className: "zl-q" }, `${TEXT.youAsked}：${truncate(cleanQuestion(lastQuestion.text), 140)}`)
             : null,
           lastAnswer
-            ? h("div", { className: "zl-answer" }, renderInline(lastAnswer.text))
-            : h("div", { className: "zl-empty" }, TEXT.noAnswer)
+            ? h("div", { className: "zl-answer" }, renderMarkdown(lastAnswer.text))
+            : transcriptError
+              ? h("div", { className: "zl-empty" }, `${TEXT.turnError}：${transcriptError}`)
+              : h("div", { className: "zl-empty" }, TEXT.noAnswer),
+          transcriptError && lastAnswer
+            ? h("div", { className: "zl-notice warn" }, `${TEXT.turnError}：${transcriptError}`)
+            : null
         ),
         item
           ? h(
@@ -764,7 +1163,14 @@ window.__ModuleLoader__.load({
         } catch {
           layout = null;
         }
-        const View = (props) => h(LiteratureView, Object.assign({}, props, { layout }));
+        const getService = (name) => {
+          try {
+            return ctx.get(name);
+          } catch {
+            return null;
+          }
+        };
+        const View = (props) => h(LiteratureView, Object.assign({}, props, { layout, getService }));
         ctx.slots.inject("conversation.view", () =>
           ctx.slots.register(
             {
